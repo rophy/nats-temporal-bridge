@@ -5,14 +5,13 @@ const nats = require('nats');
 const _ = require('lodash');
 const sc = nats.StringCodec();
 
+const db = require('./db');
+
 const app = express();
 const port = 3000;
 
 
 const servers = ["localhost:4442"];
-
-// in-memory store
-const db = {};
 
 
 // nats client.
@@ -40,17 +39,11 @@ app.post('/subscribe', (req, res) => {
   
   console.log('/subscribe', subject, namespace, workflowId, signal);
 
-  // intentionally avoided lodash since I don't want to validate param formats.
-  if (!db[subject]) db[subject] = {};
-  if (!db[subject][namespace]) db[subject][namespace] = {};
-  if (!db[subject][namespace][workflowId]) db[subject][namespace][workflowId] = {};
-  
-  
   // todo: this should be done after nc is initialized.
   let sub = nc.subscribe(subject, {
     callback: (err, msg) => onNatsSubject(err, subject, msg)
   });
-  db[subject][namespace][workflowId][signal] = sub;
+  db.add(subject, namespace, workflowId, signal, sub);
   
   res.status(200).end();
   
@@ -81,50 +74,51 @@ async function init() {
 }
 
 
-async function onNatsSubject(err, subject, msg) {
+function onNatsSubject(err, subject, msg) {
   console.log('onNatsSubject', err, subject);
   if (err) return console.error(err);
-  if (!db[subject]) return console.warn(`subscribed nats topic without temporal subscribers: ${subject}`);
-  
+
   let data = sc.decode(msg.data);
   if (data) data = JSON.stringify(msg.data);
   console.log('data', data);
-  for(let namespace in db[subject]) {
-    let temporalClient = new WorkflowClient(temporalConnection.service, {
-      namespace: namespace
-    });
-    for(let workflowId in db[subject][namespace]) {
-      let handle = temporalClient.getHandle(workflowId);
-      for(let signal in db[subject][namespace][workflowId]) {
-        try {
-          console.log('onNatsSubject', subject, namespace, workflowId, signal);
-          await handle.signal(signal);
-        } catch(signalErr) {          
-          console.trace('onNatsSubject', signalErr, signalErr.code);
-          // NOT_FOUND: instace of Error, { code: 5, details: "sql: no rows in result set" }
-          // bad, but couldn't figure out a better way
-          if (signalErr.code === 5) {
-            console.info(`workflow ${workflowId} no longer exists, removing from subscribers`);
-            let sub = db[subject][namespace][workflowId][signal];
-            delete db[subject][namespace][workflowId][signal];
-            if (Object.keys(db[subject][namespace][workflowId]).length === 0) {
-              delete db[subject][namespace][workflowId];
-              if (Object.keys(db[subject][namespace]).length === 0) {
-                delete db[subject][namespace];
-                if (Object.keys(db[subject]).length === 0) {
-                  delete db[subject];
-                  console.log(`unsubscribing nats subject: ${subject}`);
-                  sub.unsubscribe();
-                }
-              }
-            }
-          } else {
-             console.error('onNatsSubject', signalErr);
-          }
+
+
+  let prevNamespace = null;
+  let prevWorkflowId = null;
+  db.iterate(subject, async (namespace, workflowId, signal) => {
+    let temporalClient = null;
+    if (namespace != prevNamespace) {
+      temporalClient = new WorkflowClient(temporalConnection.service, {
+        namespace: namespace
+      });
+      prevNamespace = namespace;
+    }
+    let handle = null;
+    if (workflowId != prevWorkflowId) {
+      handle = temporalClient.getHandle(workflowId);
+      prevWorkflowId = workflowId;
+    }
+    try {
+      console.log('onNatsSubject', subject, namespace, workflowId, signal);
+      await handle.signal(signal);
+    } catch(signalErr) {
+
+      console.trace('onNatsSubject', signalErr, signalErr.code);
+      // NOT_FOUND: instace of Error, { code: 5, details: "sql: no rows in result set" }
+      // bad, but couldn't figure out a better way
+      if (signalErr.code === 5) {
+        console.info(`workflow ${workflowId} no longer exists, removing from subscribers`);
+        sub = db.remove(subject, namespace, workflowId, signal);
+        if (sub && !db.hasSubject(subject)) {
+          console.log(`unsubscribing nats subject: ${subject}`);
+          sub.unsubscribe();
         }
+      } else {
+        // log the error and continue.
+         console.error('onNatsSubject', signalErr);
       }
     }
-  }
+  });
 }
 
 

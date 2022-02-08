@@ -1,7 +1,7 @@
 {
   "name": "nats-temporal-bridge",
   "version": "1.0.0",
-  "description": "",
+  "description": "A web service that connect Temporal signals with NATS events",
   "main": "app.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
